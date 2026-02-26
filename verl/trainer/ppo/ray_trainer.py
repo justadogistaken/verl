@@ -368,6 +368,9 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        # Suffix cache manager for speculative decoding acceleration
+        self.suffix_cache_manager = None
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -449,6 +452,38 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _init_suffix_cache_manager(self):
+        """Initialize suffix cache manager for speculative decoding acceleration.
+
+        This method sets up the suffix cache manager if suffix cache synchronization
+        is enabled in the configuration. The manager handles distributing generated
+        sequences to all rollout workers for suffix tree updates.
+        """
+        suffix_cache_config = self.config.actor_rollout_ref.rollout.get("suffix_cache", {})
+
+        if not suffix_cache_config.get("enable", False):
+            return
+
+        try:
+            from verl.trainer.ppo.suffix_cache_manager import SuffixCacheManager
+
+            self.suffix_cache_manager = SuffixCacheManager(
+                config=self.config,
+                actor_rollout_wg=self.actor_rollout_wg,
+                port=suffix_cache_config.get("port", 6378),
+                suffix_cache_config=dict(suffix_cache_config),
+            )
+
+            if self.suffix_cache_manager.enabled:
+                logger.info(f"Suffix cache manager initialized with {len(self.suffix_cache_manager.server_urls)} servers")
+            else:
+                self.suffix_cache_manager = None
+                logger.info("Suffix cache manager disabled")
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize suffix cache manager: {e}")
+            self.suffix_cache_manager = None
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -676,6 +711,10 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Update suffix cache with validation generation results if enabled
+            if self.suffix_cache_manager is not None and self.suffix_cache_manager.enabled:
+                self.suffix_cache_manager.update_cache(test_batch, self.config.actor_rollout_ref.rollout.val_kwargs.n)
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
@@ -972,6 +1011,9 @@ class RayPPOTrainer:
             rollout_resource_pool=actor_rollout_resource_pool,
             rm_resource_pool=rm_resource_pool,
         )
+
+        # Initialize suffix cache manager if enabled
+        self._init_suffix_cache_manager()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1489,6 +1531,10 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # Update suffix cache with generated sequences for speculative decoding
+                    if self.suffix_cache_manager is not None and self.suffix_cache_manager.enabled:
+                        self.suffix_cache_manager.update_cache(batch, self.config.actor_rollout_ref.rollout.n)
+
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1737,6 +1783,10 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    # Wait for all pending suffix cache updates and shutdown
+                    if self.suffix_cache_manager is not None:
+                        self.suffix_cache_manager.wait_for_updates()
+                        self.suffix_cache_manager.shutdown()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return

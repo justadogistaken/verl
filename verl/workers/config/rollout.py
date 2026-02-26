@@ -29,6 +29,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "SuffixCacheConfig",
     "RolloutConfig",
 ]
 
@@ -118,6 +119,37 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class SuffixCacheConfig(BaseConfig):
+    """
+    Configuration for suffix cache synchronization across rollout instances.
+
+    Suffix cache enables speculative decoding acceleration by sharing
+    generated sequences across distributed rollout workers.
+    """
+
+    # Whether to enable suffix cache synchronization
+    enable: bool = False
+
+    # Port number for suffix cache servers on each rollout worker
+    port: int = 6378
+
+    # Timeout for cache update requests (seconds)
+    update_timeout: float = 5.0
+
+    # Maximum number of concurrent update threads
+    max_workers: int = 4
+
+    # Maximum number of pending async updates before blocking
+    max_pending_updates: int = 100
+
+    # Whether to wait for cache updates before starting next step
+    blocking_update: bool = False
+
+    # Timeout for blocking wait (seconds), None for no limit
+    blocking_timeout: Optional[float] = None
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -184,6 +216,9 @@ class RolloutConfig(BaseConfig):
 
     # Use Prometheus to collect and monitor rollout statistics
     prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
+
+    # Suffix cache configuration for speculative decoding acceleration
+    suffix_cache: SuffixCacheConfig = field(default_factory=SuffixCacheConfig)
 
     # Extension point for custom configurations
     custom: Optional[dict] = None
